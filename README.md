@@ -34,6 +34,7 @@ Splitting is done by **location group**, not random windows. The same city/locat
 python -m venv .venv
 # Linux/macOS
 source .venv/bin/activate
+python -m pip install --upgrade pip
 # Windows PowerShell: .venv\Scripts\Activate.ps1
 
 pip install -r requirements.txt
