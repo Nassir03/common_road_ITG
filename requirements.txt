@@ -1,0 +1,5 @@
+torch>=2.2
+matplotlib>=3.8
+pytest>=8.0
+# Optional only for model/crgeo_adapter.py:
+# commonroad-geometric
