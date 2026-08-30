@@ -1,153 +1,72 @@
-# CommonRoad-Geometric Paper Trajectory Prediction — Paper-Aligned Implementation
+# CommonRoad-ITG + GNN — Complete Implementation
 
-This version replaces the earlier custom **ITG/ROI/BFS/hop/branch** trajectory model with the method demonstrated in the CommonRoad-Geometric paper by Meyer et al. (2023).
+This project implements the supplied CommonRoad-ITG method.
 
-## What the code now implements
+## What is implemented
 
-```text
-NuPlan
-  -> CommonRoad conversion
-  -> heterogeneous temporal graph
-       Vehicle nodes + Lanelet nodes
-       V2V + V2L + L2V + L2L + causal VTV edges
-  -> feature encoding
-       Time2Vec(VTV delta time)
-       GRU(lane boundary waypoint sequence)
-       learnable L2L relation embedding
-  -> edge-enhanced HGT encoder
-  -> vehicle embedding
-  -> GRU decoder
-  -> local [dx, dy, dtheta] sequence
-  -> recurrent local-frame integration
-  -> future trajectory at 0.2, 0.4, 0.6, 0.8, 1.0 seconds
-  -> ADE training loss, ADE/FDE evaluation
-```
+- vehicle and lanelet nodes;
+- L2L predecessor, successor, adjacent, merging, diverging, and **conflicting** relations;
+- dynamic **multiple** V2L assignments and reverse L2V edges;
+- ROT -> ROC -> ROI -> FIFO BFS -> inward ITG;
+- VOI-specific hop and branch labels (no ambiguous contextual duplicate labels);
+- direct/indirect, relative position, relative velocity, normalized distance edge features;
+- ITG rebuilt at every observation time step;
+- causal VTV temporal edges and Time2Vec;
+- MAX_HOPS V2V GNN layers;
+- lane GRU, heterogeneous message passing, temporal GRU, trajectory decoder;
+- proximity-only radius baseline with the same neural architecture;
+- ADE and FDE evaluation;
+- location-disjoint train/validation/test split.
 
-The exact feature mapping is documented in `PAPER_ALIGNMENT.md`.
+## Supplied-data split
 
-## Important before training
+The bundled `data/raw/{train,val,test}` directories were built from the user's attached data
 
-The **code is paper-aligned, but the data bundled in your original ZIP is not the paper’s NuPlan Singapore/Boston/Pittsburgh dataset.** Training on that data is useful for checking that the implementation works, but its ADE/FDE must not be compared directly with the paper’s Table IV.
+- `data/splits/summary.json`
+- `data/splits/split_manifest.csv`
+- `data/splits/excluded.csv`
 
-For true paper reproduction, first obtain/convert the NuPlan scenarios with the official CommonRoad converter, then prepare separate city experiments for Singapore, Boston and Pittsburgh. The paper states that each experiment is trained and validated on data from the same city.
 
-## Install
+## 1. Install
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate          # Linux/macOS
+# Linux/macOS
+source .venv/bin/activate
+python -m pip install --upgrade pip
 # Windows PowerShell: .venv\Scripts\Activate.ps1
 
-python -m pip install --upgrade pip
 pip install -r requirements.txt
 python -m pytest -q
 ```
-
-## Data format
-
-The preprocessing script expects already split CommonRoad XML files:
-
-```text
-data/raw/
-  train/*.xml
-  val/*.xml
-  test/*.xml
-```
-
-Convert them to compact `.scenario.pt` files:
-
 ```bash
 python scripts/preprocess.py
 ```
 
-This produces:
-
-```text
-data/processed/
-  train/*.scenario.pt
-  val/*.scenario.pt
-  test/*.scenario.pt
-```
-
-## Inspect one graph before training
+## 3. Train the proximity baseline
 
 ```bash
-python scripts/inspect_sample.py \
-  --scenario-dir data/processed/train \
-  --index 0
+python scripts/train.py --edge-mode radius --epochs 30 --output outputs/radius_model.pt 
 ```
 
-You should see:
-
-- vehicle feature dimension = 10;
-- V2V feature dimension = 8;
-- V2L/L2V feature dimension = 6;
-- all five edge types: V2V, V2L, L2V, L2L, VTV;
-- prediction times `[0.2, 0.4, 0.6, 0.8, 1.0]`.
-
-## Train
-
-Full default architecture:
+## 4. Train the proposed ITG model
 
 ```bash
 python scripts/train.py \
-  --data-root data/processed \
+  --edge-mode itg \
   --epochs 30 \
-  --output outputs/crgeo_paper_model.pt
+  --output outputs/itg_model.pt
 ```
 
-Quick smoke test:
+For a quick execution check:
 
 ```bash
-python scripts/train.py \
-  --data-root data/processed \
-  --epochs 1 \
-  --stride 10 \
-  --max-train-samples 5 \
-  --max-val-samples 2 \
-  --hidden-dim 32 \
-  --heads 4 \
-  --hgt-layers 1 \
-  --decoder-hidden-dim 64 \
-  --output outputs/smoke.pt
+python scripts/train.py --edge-mode itg --epochs 30 --max-train-samples 20 --max-val-samples 10 --output outputs/itg_smoke.pt
 ```
 
-The small smoke configuration is only for checking execution. Use the defaults for the intended full model.
-
-## Evaluate
+## 5. Evaluate held-out test locations
 
 ```bash
-python scripts/evaluate.py \
-  --data-root data/processed \
-  --split test \
-  --checkpoint outputs/crgeo_paper_model.pt \
-  --output-csv outputs/test_metrics.csv
+python scripts/evaluate.py --checkpoint outputs/radius_model.pt --output-csv outputs/radius_test.csv
+python scripts/evaluate.py --checkpoint outputs/itg_model.pt --output-csv outputs/itg_test.csv
 ```
-
-The reported metrics are:
-
-\[
-ADE = \frac{1}{T}\sum_{k=1}^{T}\|\hat p_k-p_k\|_2
-\]
-
-and
-
-\[
-FDE = \|\hat p_T-p_T\|_2.
-\]
-
-## Predict one sample
-
-```bash
-python scripts/predict.py \
-  --data-root data/processed \
-  --split test \
-  --checkpoint outputs/crgeo_paper_model.pt \
-  --index 0
-```
-
-It prints predicted and ground-truth `(x, y, orientation)` for the five future steps.
-
-## What was removed from the model path
-
-The previous implementation used custom **ROT -> ROC -> ROI -> BFS -> ITG** construction, hop/branch labels, a radius baseline, and a 12-step XY-only decoder. Those are not the trajectory-prediction architecture described in the cr-geo paper, so they are no longer used by this implementation.
