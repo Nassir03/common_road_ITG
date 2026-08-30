@@ -1,8 +1,10 @@
-.venv/
 __pycache__/
-*.py[cod]
 .pytest_cache/
+*.pyc
+.venv/
+data/*/processed/
+data/*/split_manifest.csv
+data/*/summary.json
 outputs/*.pt
+outputs/*.json
 outputs/*.csv
-data/raw/**/*.xml
-data/processed/**/*.scenario.pt

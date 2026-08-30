@@ -1,93 +1,35 @@
-#!/usr/bin/env python3
-"""Evaluate a trained paper-aligned model using ADE and FDE."""
+#!/usr/bin/env python
 from __future__ import annotations
-
+import argparse, csv, json
 from pathlib import Path
-import argparse
-import csv
-import json
 import sys
-
+ROOT=Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 import torch
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
 from model.gnn_dataset import CommonRoadTemporalGraphDataset
 from model.gnn_model import CrGeoTrajectoryPredictionModel
-from model.metrics import ade_fde, trajectory_error_sums
+from model.metrics import ade_fde
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--data-root", default=str(ROOT / "data" / "processed"))
-    p.add_argument("--split", choices=["train", "val", "test"], default="test")
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--output-csv", default="outputs/test_metrics.csv")
-    p.add_argument("--max-samples", type=int, default=0)
-    args = p.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    dataset_cfg = ckpt.get("dataset", {})
-    ds = CommonRoadTemporalGraphDataset(
-        Path(args.data_root) / args.split,
-        obs_steps=int(dataset_cfg.get("obs_steps", 15)),
-        pred_steps=int(dataset_cfg.get("pred_steps", 5)),
-        model_dt=float(dataset_cfg.get("model_dt", 0.2)),
-        stride=int(dataset_cfg.get("stride", 1)),
-    )
-    model = CrGeoTrajectoryPredictionModel(**ckpt.get("model_kwargs", {})).to(device)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-
-    rows: list[dict] = []
-    ade_sum = fde_sum = 0.0
-    ade_count = fde_count = 0
-    limit = len(ds) if args.max_samples <= 0 else min(len(ds), args.max_samples)
-
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument("--city",required=True,choices=["boston","pittsburgh","singapore"]); ap.add_argument("--checkpoint",required=True); ap.add_argument("--data-root",default=None); ap.add_argument("--output-csv",default=None); ap.add_argument("--max-samples",type=int,default=0); args=ap.parse_args()
+    ckpt=torch.load(args.checkpoint,map_location="cpu",weights_only=False); mode=ckpt.get("v2v_mode","paper")
+    data_root=Path(args.data_root) if args.data_root else ROOT/"data"/args.city/"processed"
+    ds=CommonRoadTemporalGraphDataset(data_root/"test",v2v_mode=mode); device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model=CrGeoTrajectoryPredictionModel(**ckpt.get("model_kwargs",{"v2v_edge_dim":ds.v2v_edge_dim})).to(device); model.load_state_dict(ckpt["model_state_dict"]); model.eval()
+    rows=[]; total_ade=total_fde=0.0; total_targets=0; n=min(len(ds),args.max_samples) if args.max_samples>0 else len(ds)
     with torch.no_grad():
-        for i in range(limit):
-            sample = ds[i]
-            output = model(sample)
-            target = sample["target_position"].to(device)
-            mask = sample["target_mask"].to(device)
-            ade, fde = ade_fde(output["position"], target, mask)
-            a_sum, f_sum, a_count, f_count = trajectory_error_sums(output["position"], target, mask)
-            ade_sum += float(a_sum)
-            fde_sum += float(f_sum)
-            ade_count += a_count
-            fde_count += f_count
-            rows.append({
-                "benchmark_id": sample["meta"]["benchmark_id"],
-                "location_group": sample["meta"]["location_group"],
-                "start_time_step": sample["meta"]["observation_time_steps"][0],
-                "target_vehicles": int(mask.sum()),
-                "ADE_m": float(ade),
-                "FDE_m": float(fde),
-            })
-
-    summary = {
-        "split": args.split,
-        "samples": len(rows),
-        "mean_ADE_m": ade_sum / max(ade_count, 1),
-        "mean_FDE_m": fde_sum / max(fde_count, 1),
-        "valid_prediction_points": ade_count,
-        "valid_trajectories": fde_count,
-    }
-
-    out = Path(args.output_csv)
-    if not out.is_absolute():
-        out = ROOT / out
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if rows:
-        with out.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-    print(json.dumps(summary, indent=2))
-    print("saved:", out)
-
-
-if __name__ == "__main__":
-    main()
+        for i in range(n):
+            s=ds[i]; pred=model(s)["position"]; target=s["target_position"].to(device); mask=s["target_mask"].to(device); m=ade_fde(pred,target,mask)
+            if m["count"]==0: continue
+            total_ade+=m["ade"]*m["count"]; total_fde+=m["fde"]*m["count"]; total_targets+=m["count"]
+            rows.append({"sample":i,"benchmark_id":s["meta"]["benchmark_id"],"ADE_m":m["ade"],"FDE_m":m["fde"],"targets":m["count"]})
+    if total_targets==0: raise RuntimeError("No valid test targets")
+    summary={"city":args.city,"v2v_mode":mode,"test_samples":len(rows),"test_targets":total_targets,"mean_ADE_m":total_ade/total_targets,"mean_FDE_m":total_fde/total_targets}
+    print(json.dumps(summary,indent=2))
+    if args.output_csv:
+        out=Path(args.output_csv); out.parent.mkdir(parents=True,exist_ok=True)
+        with out.open("w",newline="",encoding="utf-8") as f:
+            w=csv.DictWriter(f,fieldnames=["sample","benchmark_id","ADE_m","FDE_m","targets"]); w.writeheader(); w.writerows(rows)
+        out.with_suffix(".summary.json").write_text(json.dumps(summary,indent=2),encoding="utf-8"); print(f"csv={out}")
+if __name__=="__main__": main()

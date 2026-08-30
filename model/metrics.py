@@ -1,52 +1,30 @@
-"""Trajectory-prediction loss and evaluation metrics from the paper."""
+"""Average displacement error (ADE) and final displacement error (FDE)."""
 from __future__ import annotations
-
 import torch
 
 
-def _valid_distances(
-    prediction_position: torch.Tensor,
-    target_position: torch.Tensor,
-    target_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if prediction_position.shape != target_position.shape:
-        raise ValueError(f"Prediction/target shape mismatch: {prediction_position.shape} vs {target_position.shape}")
-    distances = torch.linalg.vector_norm(prediction_position - target_position, dim=-1)
-    if target_mask is None:
-        target_mask = torch.ones(distances.size(0), dtype=torch.bool, device=distances.device)
-    target_mask = target_mask.to(distances.device, dtype=torch.bool)
-    if not bool(target_mask.any()):
-        raise ValueError("No valid target vehicles in this sample")
-    return distances[target_mask], target_mask
+def ade_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean Euclidean displacement over all future steps and valid targets."""
+    dist = torch.linalg.vector_norm(pred - target, dim=-1)
+    valid = mask[:, None].expand_as(dist)
+    if not bool(valid.any()):
+        return dist.sum() * 0.0
+    return dist[valid].mean()
 
 
-def ade_fde(
-    prediction_position: torch.Tensor,
-    target_position: torch.Tensor,
-    target_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """ADE and FDE in metres, averaged over valid vehicle trajectories."""
-    distances, _ = _valid_distances(prediction_position, target_position, target_mask)
-    ade = distances.mean()
-    fde = distances[:, -1].mean()
-    return ade, fde
+def ade_fde(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict[str, float | int]:
+    """Per-target averaged ADE/FDE in metres."""
+    if not bool(mask.any()):
+        return {"ade": float("nan"), "fde": float("nan"), "count": 0}
+    dist = torch.linalg.vector_norm(pred - target, dim=-1)
+    valid_dist = dist[mask]
+    ade_per_target = valid_dist.mean(dim=1)
+    fde_per_target = valid_dist[:, -1]
+    return {
+        "ade": float(ade_per_target.mean().detach().cpu()),
+        "fde": float(fde_per_target.mean().detach().cpu()),
+        "count": int(mask.sum().detach().cpu()),
+    }
 
-
-def trajectory_ade_loss(
-    prediction_position: torch.Tensor,
-    target_position: torch.Tensor,
-    target_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Paper training objective: Average Displacement Error (ADE)."""
-    ade, _ = ade_fde(prediction_position, target_position, target_mask)
-    return ade
-
-
-def trajectory_error_sums(
-    prediction_position: torch.Tensor,
-    target_position: torch.Tensor,
-    target_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Return sums/counts for dataset-level ADE/FDE aggregation."""
-    distances, _ = _valid_distances(prediction_position, target_position, target_mask)
-    return distances.sum(), distances[:, -1].sum(), int(distances.numel()), int(distances.size(0))
+# Backward-compatible alias used by earlier repository versions.
+trajectory_ade_loss = ade_loss
