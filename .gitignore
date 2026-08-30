@@ -1,17 +1,8 @@
-# Python bytecode / caches
+.venv/
 __pycache__/
-**/__pycache__/
 *.py[cod]
 .pytest_cache/
-.pyright/
-
-# Virtual environments
-.venv/
-venv/
-
-# Environment files
-.env
-.env.*
-
-# Editors / OS
-.vscode/
+outputs/*.pt
+outputs/*.csv
+data/raw/**/*.xml
+data/processed/**/*.scenario.pt

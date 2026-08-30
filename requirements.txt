@@ -1,5 +1,4 @@
 torch>=2.2
-matplotlib>=3.8
+numpy>=1.24
+scipy>=1.10
 pytest>=8.0
-# Optional only for model/crgeo_adapter.py:
-# commonroad-geometric

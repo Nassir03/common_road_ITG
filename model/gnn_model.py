@@ -1,168 +1,366 @@
-"""Simple heterogeneous, temporal, hop-aware GNN for trajectory prediction.
+"""Paper-aligned spatiotemporal trajectory-prediction network.
 
-It intentionally keeps the architecture understandable:
-- lanelet polyline GRU + L2L message passing,
-- both V2L and L2V message passing,
-- MAX_HOPS V2V layers so a MAX_HOPS ITG path can reach the VOI,
-- causal VTV edges with Time2Vec,
-- temporal GRU + GRU trajectory decoder.
+Architecture follows Meyer et al. (2023):
+  1. GRU lanelet-geometry encoder.
+  2. Learnable embedding for L2L adjacency type.
+  3. Time2Vec encoding for the VTV delta-time attribute.
+  4. Edge-enhanced Heterogeneous Graph Transformer (HGT) over
+     V2V, V2L, L2V, L2L and causal VTV edges.
+  5. GRU decoder producing local (dx, dy, dtheta) transitions.
+  6. Repeated local-frame integration to obtain future global states.
+
+The paper does not publish every hidden size / decoder input detail. Those are
+kept explicit in model/config.py. The graph semantics, feature families,
+prediction horizon and ADE objective match the paper.
 """
 from __future__ import annotations
 
+import math
+from typing import Dict
+
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence
 
 from .config import (
-    HIDDEN_DIM, TIME2VEC_DIM, ITG_EDGE_FEATURE_DIM, L2L_RELATION_COUNT,
-    PRED_STEPS, MAX_HOPS,
+    DECODER_HIDDEN_DIM,
+    HGT_HEADS,
+    HGT_LAYERS,
+    HIDDEN_DIM,
+    L2L_NUMERIC_EDGE_DIM,
+    L2L_RELATION_COUNT,
+    L2L_RELATION_EMBED_DIM,
+    LANE_GEOMETRY_DIM,
+    LANE_GRU_HIDDEN_DIM,
+    LANE_STATIC_DIM,
+    PRED_STEPS,
+    TIME2VEC_DIM,
+    V2L_EDGE_DIM,
+    V2V_EDGE_DIM,
+    VEHICLE_FEATURE_DIM,
 )
 
 
+NODE_TYPES = ("vehicle", "lane")
+RELATION_META = {
+    "v2v": ("vehicle", "vehicle"),
+    "v2l": ("vehicle", "lane"),
+    "l2v": ("lane", "vehicle"),
+    "l2l": ("lane", "lane"),
+    "vtv": ("vehicle", "vehicle"),
+}
+
+
 class Time2Vec(nn.Module):
+    """Learnable time representation with one linear and sinusoidal channels."""
+
     def __init__(self, dim: int = TIME2VEC_DIM):
         super().__init__()
         if dim < 2:
-            raise ValueError("Time2Vec dim must be >= 2")
-        self.linear_w = nn.Parameter(torch.randn(1))
-        self.linear_b = nn.Parameter(torch.zeros(1))
-        self.periodic_w = nn.Parameter(torch.randn(dim - 1))
-        self.periodic_b = nn.Parameter(torch.zeros(dim - 1))
+            raise ValueError("Time2Vec dimension must be >= 2")
+        self.dim = int(dim)
+        self.frequency = nn.Parameter(torch.empty(dim))
+        self.phase = nn.Parameter(torch.empty(dim))
+        nn.init.normal_(self.frequency, mean=0.0, std=1.0)
+        nn.init.zeros_(self.phase)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t = t.reshape(-1, 1)
-        return torch.cat([t * self.linear_w + self.linear_b, torch.sin(t * self.periodic_w + self.periodic_b)], dim=-1)
+        raw = t * self.frequency.reshape(1, -1) + self.phase.reshape(1, -1)
+        return torch.cat([raw[:, :1], torch.sin(raw[:, 1:])], dim=-1)
 
 
-class EdgeMessageLayer(nn.Module):
-    def __init__(self, hidden_dim: int, edge_dim: int):
+class LaneletEncoder(nn.Module):
+    """GRU encoding of variable-length lane boundary waypoint sequences."""
+
+    def __init__(self, hidden_dim: int = HIDDEN_DIM, gru_hidden_dim: int = LANE_GRU_HIDDEN_DIM):
         super().__init__()
-        self.message = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        self.gru = nn.GRU(LANE_GEOMETRY_DIM, gru_hidden_dim, batch_first=True)
+        self.static_norm = nn.LayerNorm(LANE_STATIC_DIM)
+        self.output = nn.Sequential(
+            nn.Linear(gru_hidden_dim + LANE_STATIC_DIM, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
         )
-        self.update = nn.GRUCell(hidden_dim, hidden_dim)
-        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
-        if h.numel() == 0 or edge_index.numel() == 0:
-            return h
-        src, dst = edge_index
-        msg = self.message(torch.cat([h[src], h[dst], edge_attr], dim=-1))
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, msg)
-        deg = torch.zeros(h.size(0), device=h.device, dtype=h.dtype)
-        deg.index_add_(0, dst, torch.ones(dst.numel(), device=h.device, dtype=h.dtype))
-        agg = agg / deg.clamp_min(1.0).unsqueeze(-1)
-        return self.norm(self.update(agg, h))
+    def forward(self, geometry: torch.Tensor, lengths: torch.Tensor, static_x: torch.Tensor) -> torch.Tensor:
+        if static_x.size(0) == 0:
+            return static_x.new_empty((0, self.output[-1].normalized_shape[0]))
+        packed = pack_padded_sequence(
+            geometry,
+            lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        _, hidden = self.gru(packed)
+        lane_geometry_h = hidden[-1]
+        return self.output(torch.cat([lane_geometry_h, self.static_norm(static_x)], dim=-1))
 
 
-class BipartiteMessageLayer(nn.Module):
-    """Messages from one node type into another node type."""
-    def __init__(self, hidden_dim: int):
+class EdgeEnhancedHGTLayer(nn.Module):
+    """HGT message passing where both attention and messages use edge features.
+
+    For each relation r=(source,target), node-type-specific Q/K/V projections are
+    combined with edge-specific Q/K/V projections. Relation-specific attention
+    and message matrices then transform K and V. Attention is normalized over
+    incoming edges per destination node and head. Different relation outputs
+    are merged by elementwise max before a learned residual update.
+    """
+
+    def __init__(self, hidden_dim: int, heads: int, edge_dims: dict[str, int]):
         super().__init__()
-        self.message = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
+        if hidden_dim % heads != 0:
+            raise ValueError("hidden_dim must be divisible by heads")
+        self.hidden_dim = hidden_dim
+        self.heads = heads
+        self.head_dim = hidden_dim // heads
+
+        self.q_node = nn.ModuleDict({t: nn.Linear(hidden_dim, hidden_dim) for t in NODE_TYPES})
+        self.k_node = nn.ModuleDict({t: nn.Linear(hidden_dim, hidden_dim) for t in NODE_TYPES})
+        self.v_node = nn.ModuleDict({t: nn.Linear(hidden_dim, hidden_dim) for t in NODE_TYPES})
+        self.out_node = nn.ModuleDict({t: nn.Linear(hidden_dim, hidden_dim) for t in NODE_TYPES})
+        self.norm = nn.ModuleDict({t: nn.LayerNorm(hidden_dim) for t in NODE_TYPES})
+        self.skip = nn.ParameterDict({t: nn.Parameter(torch.zeros(1)) for t in NODE_TYPES})
+
+        self.edge_q = nn.ModuleDict({r: nn.Linear(edge_dims[r], hidden_dim) for r in RELATION_META})
+        self.edge_k = nn.ModuleDict({r: nn.Linear(edge_dims[r], hidden_dim) for r in RELATION_META})
+        self.edge_v = nn.ModuleDict({r: nn.Linear(edge_dims[r], hidden_dim) for r in RELATION_META})
+
+        self.relation_attention = nn.ParameterDict()
+        self.relation_message = nn.ParameterDict()
+        self.relation_prior = nn.ParameterDict()
+        for r in RELATION_META:
+            att = nn.Parameter(torch.empty(heads, self.head_dim, self.head_dim))
+            msg = nn.Parameter(torch.empty(heads, self.head_dim, self.head_dim))
+            nn.init.xavier_uniform_(att)
+            nn.init.xavier_uniform_(msg)
+            self.relation_attention[r] = att
+            self.relation_message[r] = msg
+            self.relation_prior[r] = nn.Parameter(torch.ones(heads))
+
+    @staticmethod
+    def _segment_softmax(scores: torch.Tensor, dst: torch.Tensor, n_dst: int) -> torch.Tensor:
+        """Softmax over incoming edges for every destination node and head."""
+        if scores.numel() == 0:
+            return scores
+        index = dst[:, None].expand(-1, scores.size(1))
+        max_per_dst = torch.full(
+            (n_dst, scores.size(1)), -torch.inf,
+            dtype=scores.dtype, device=scores.device,
         )
-        self.norm = nn.LayerNorm(hidden_dim)
+        max_per_dst.scatter_reduce_(0, index, scores, reduce="amax", include_self=True)
+        exp_scores = torch.exp(scores - max_per_dst[dst])
+        denom = torch.zeros((n_dst, scores.size(1)), dtype=scores.dtype, device=scores.device)
+        denom.scatter_add_(0, index, exp_scores)
+        return exp_scores / denom[dst].clamp_min(1e-12)
 
-    def forward(self, source_h: torch.Tensor, target_h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        if source_h.numel() == 0 or target_h.numel() == 0 or edge_index.numel() == 0:
-            return target_h
-        src, dst = edge_index
-        msg = self.message(torch.cat([source_h[src], target_h[dst]], dim=-1))
-        agg = torch.zeros_like(target_h)
-        agg.index_add_(0, dst, msg)
-        deg = torch.zeros(target_h.size(0), device=target_h.device, dtype=target_h.dtype)
-        deg.index_add_(0, dst, torch.ones(dst.numel(), device=target_h.device, dtype=target_h.dtype))
-        return self.norm(target_h + agg / deg.clamp_min(1.0).unsqueeze(-1))
+    def forward(
+        self,
+        node_h: dict[str, torch.Tensor],
+        edge_index: dict[str, torch.Tensor],
+        edge_attr: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        relation_outputs: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {t: [] for t in NODE_TYPES}
+
+        for relation, (src_type, dst_type) in RELATION_META.items():
+            ei = edge_index[relation]
+            if ei.numel() == 0 or node_h[src_type].size(0) == 0 or node_h[dst_type].size(0) == 0:
+                continue
+            src, dst = ei[0], ei[1]
+            e = edge_attr[relation]
+            if e.size(0) != src.numel():
+                raise ValueError(f"{relation}: edge attribute count does not match edge count")
+
+            q = self.q_node[dst_type](node_h[dst_type][dst]).view(-1, self.heads, self.head_dim)
+            k = self.k_node[src_type](node_h[src_type][src]).view(-1, self.heads, self.head_dim)
+            v = self.v_node[src_type](node_h[src_type][src]).view(-1, self.heads, self.head_dim)
+
+            q = q + self.edge_q[relation](e).view(-1, self.heads, self.head_dim)
+            k = k + self.edge_k[relation](e).view(-1, self.heads, self.head_dim)
+            v = v + self.edge_v[relation](e).view(-1, self.heads, self.head_dim)
+
+            k_meta = torch.einsum("ehd,hdf->ehf", k, self.relation_attention[relation])
+            v_meta = torch.einsum("ehd,hdf->ehf", v, self.relation_message[relation])
+            score = (q * k_meta).sum(dim=-1)
+            score = score * self.relation_prior[relation].reshape(1, -1) / math.sqrt(self.head_dim)
+            alpha = self._segment_softmax(score, dst, node_h[dst_type].size(0))
+
+            agg = node_h[dst_type].new_zeros((node_h[dst_type].size(0), self.heads, self.head_dim))
+            agg.index_add_(0, dst, alpha.unsqueeze(-1) * v_meta)
+            agg = agg.reshape(node_h[dst_type].size(0), self.hidden_dim)
+            has_incoming = torch.zeros(node_h[dst_type].size(0), dtype=torch.bool, device=dst.device)
+            has_incoming[dst] = True
+            relation_outputs[dst_type].append((agg, has_incoming))
+
+        out: dict[str, torch.Tensor] = {}
+        for node_type in NODE_TYPES:
+            h = node_h[node_type]
+            if h.size(0) == 0 or not relation_outputs[node_type]:
+                out[node_type] = h
+                continue
+
+            candidates = []
+            masks = []
+            for rel_agg, rel_mask in relation_outputs[node_type]:
+                candidates.append(rel_agg)
+                masks.append(rel_mask)
+            stacked = torch.stack(candidates, dim=0)  # [R,N,H]
+            mask = torch.stack(masks, dim=0)          # [R,N]
+            masked = stacked.masked_fill(~mask.unsqueeze(-1), -torch.inf)
+            aggregated = masked.max(dim=0).values
+            any_incoming = mask.any(dim=0)
+            aggregated = torch.where(any_incoming.unsqueeze(-1), aggregated, torch.zeros_like(aggregated))
+
+            transformed = torch.relu(self.out_node[node_type](aggregated))
+            beta = torch.sigmoid(self.skip[node_type])
+            updated = beta * transformed + (1.0 - beta) * h
+            # Nodes with no incoming messages remain unchanged.
+            updated = torch.where(any_incoming.unsqueeze(-1), updated, h)
+            out[node_type] = self.norm[node_type](updated)
+        return out
 
 
-class SimpleCommonRoadITGGNN(nn.Module):
-    def __init__(self, hidden_dim: int = HIDDEN_DIM, pred_steps: int = PRED_STEPS, v2v_layers: int = MAX_HOPS):
+class LocalTrajectoryGRUDecoder(nn.Module):
+    """Generate and integrate local position/orientation deltas autoregressively."""
+
+    def __init__(self, context_dim: int, hidden_dim: int = DECODER_HIDDEN_DIM, pred_steps: int = PRED_STEPS):
+        super().__init__()
+        self.pred_steps = int(pred_steps)
+        self.init_hidden = nn.Sequential(nn.Linear(context_dim, hidden_dim), nn.Tanh())
+        self.cell = nn.GRUCell(3, hidden_dim)
+        self.delta_head = nn.Linear(hidden_dim, 3)
+        # Small initial transitions make the first optimization steps stable.
+        nn.init.normal_(self.delta_head.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.delta_head.bias)
+
+    @staticmethod
+    def _wrap_tensor(theta: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(torch.sin(theta), torch.cos(theta))
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        current_position: torch.Tensor,
+        current_orientation: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        n = context.size(0)
+        hidden = self.init_hidden(context)
+        previous_delta = context.new_zeros((n, 3))
+        position = current_position
+        orientation = current_orientation
+        positions = []
+        orientations = []
+        local_deltas = []
+
+        for _ in range(self.pred_steps):
+            hidden = self.cell(previous_delta, hidden)
+            delta = self.delta_head(hidden)
+            dx_local, dy_local, dtheta = delta[:, 0], delta[:, 1], delta[:, 2]
+
+            c = torch.cos(orientation)
+            s = torch.sin(orientation)
+            dx_world = c * dx_local - s * dy_local
+            dy_world = s * dx_local + c * dy_local
+            position = position + torch.stack([dx_world, dy_world], dim=-1)
+            orientation = self._wrap_tensor(orientation + dtheta)
+
+            positions.append(position)
+            orientations.append(orientation)
+            local_deltas.append(delta)
+            previous_delta = delta
+
+        return {
+            "position": torch.stack(positions, dim=1),
+            "orientation": torch.stack(orientations, dim=1),
+            "local_delta": torch.stack(local_deltas, dim=1),
+        }
+
+
+class CrGeoTrajectoryPredictionModel(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int = HIDDEN_DIM,
+        heads: int = HGT_HEADS,
+        hgt_layers: int = HGT_LAYERS,
+        pred_steps: int = PRED_STEPS,
+        decoder_hidden_dim: int = DECODER_HIDDEN_DIM,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.pred_steps = pred_steps
 
-        self.vehicle_encoder = nn.Sequential(nn.Linear(10, hidden_dim), nn.ReLU(), nn.LayerNorm(hidden_dim))
-        self.lane_gru = nn.GRU(4, hidden_dim, batch_first=True)
-        self.lane_scalar_encoder = nn.Linear(3, hidden_dim)
-        self.l2l_relation = nn.Embedding(L2L_RELATION_COUNT, 8)
-        self.l2l_layer = EdgeMessageLayer(hidden_dim, 8)
-        self.vehicle_to_lane = BipartiteMessageLayer(hidden_dim)
-        self.lane_to_vehicle = BipartiteMessageLayer(hidden_dim)
-
-        self.itg_edge_encoder = nn.Sequential(
-            nn.Linear(ITG_EDGE_FEATURE_DIM, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
+        self.vehicle_encoder = nn.Sequential(
+            nn.LayerNorm(VEHICLE_FEATURE_DIM),
+            nn.Linear(VEHICLE_FEATURE_DIM, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
         )
-        self.v2v_layers = nn.ModuleList([EdgeMessageLayer(hidden_dim, hidden_dim) for _ in range(v2v_layers)])
-
+        self.lane_encoder = LaneletEncoder(hidden_dim=hidden_dim)
+        self.l2l_relation_embedding = nn.Embedding(L2L_RELATION_COUNT, L2L_RELATION_EMBED_DIM)
         self.vtv_time2vec = Time2Vec(TIME2VEC_DIM)
-        self.vtv_edge_encoder = nn.Sequential(
-            nn.Linear(TIME2VEC_DIM, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.vtv_layer = EdgeMessageLayer(hidden_dim, hidden_dim)
-        self.temporal_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
 
-        self.future_time2vec = Time2Vec(TIME2VEC_DIM)
-        self.decoder = nn.GRU(hidden_dim + TIME2VEC_DIM, hidden_dim, batch_first=True)
-        self.head = nn.Linear(hidden_dim, 2)
+        edge_dims = {
+            "v2v": V2V_EDGE_DIM,
+            "v2l": V2L_EDGE_DIM,
+            "l2v": V2L_EDGE_DIM,
+            "l2l": L2L_NUMERIC_EDGE_DIM + L2L_RELATION_EMBED_DIM,
+            "vtv": V2V_EDGE_DIM + TIME2VEC_DIM,
+        }
+        self.hgt = nn.ModuleList([
+            EdgeEnhancedHGTLayer(hidden_dim, heads, edge_dims) for _ in range(hgt_layers)
+        ])
+        self.decoder = LocalTrajectoryGRUDecoder(hidden_dim, decoder_hidden_dim, pred_steps)
 
-    def encode_lanes(self, lane_geometry, lane_x, l2l_edge_index, l2l_type):
-        if lane_geometry.size(0) == 0:
-            return torch.empty((0, self.hidden_dim), device=lane_geometry.device)
-        _, h = self.lane_gru(lane_geometry)
-        lane_h = h[-1] + self.lane_scalar_encoder(lane_x)
-        if l2l_edge_index.numel() > 0:
-            lane_h = self.l2l_layer(lane_h, l2l_edge_index, self.l2l_relation(l2l_type))
-        return lane_h
+    def _move_edge_index(self, sample: dict, device: torch.device) -> dict[str, torch.Tensor]:
+        return {k: v.to(device) for k, v in sample["edge_index"].items()}
 
-    def forward(self, sample: dict) -> torch.Tensor:
+    def _prepare_edge_attr(self, sample: dict, device: torch.device) -> dict[str, torch.Tensor]:
+        raw = sample["edge_attr"]
+        l2l_numeric = raw["l2l_numeric"].to(device)
+        l2l_type = raw["l2l_type"].to(device)
+        if l2l_numeric.size(0):
+            l2l = torch.cat([l2l_numeric, self.l2l_relation_embedding(l2l_type)], dim=-1)
+        else:
+            l2l = l2l_numeric.new_empty((0, L2L_NUMERIC_EDGE_DIM + L2L_RELATION_EMBED_DIM))
+
+        vtv_motion = raw["vtv_motion"].to(device)
+        vtv_dt = raw["vtv_delta_t"].to(device)
+        if vtv_motion.size(0):
+            vtv = torch.cat([vtv_motion, self.vtv_time2vec(vtv_dt)], dim=-1)
+        else:
+            vtv = vtv_motion.new_empty((0, V2V_EDGE_DIM + TIME2VEC_DIM))
+
+        return {
+            "v2v": raw["v2v"].to(device),
+            "v2l": raw["v2l"].to(device),
+            "l2v": raw["l2v"].to(device),
+            "l2l": l2l,
+            "vtv": vtv,
+        }
+
+    def forward(self, sample: dict) -> dict[str, torch.Tensor]:
         device = next(self.parameters()).device
-        lane_h_base = self.encode_lanes(
-            sample["lane_geometry"].to(device), sample["lane_x"].to(device),
-            sample["l2l_edge_index"].to(device), sample["l2l_type"].to(device),
+        vehicle_h = self.vehicle_encoder(sample["vehicle_x"].to(device))
+        lane_h = self.lane_encoder(
+            sample["lane_geometry"].to(device),
+            sample["lane_geometry_lengths"].to(device),
+            sample["lane_x"].to(device),
         )
-        observation_times = sample["observation_times"].to(device)
+        node_h = {"vehicle": vehicle_h, "lane": lane_h}
+        edge_index = self._move_edge_index(sample, device)
+        edge_attr = self._prepare_edge_attr(sample, device)
 
-        history = []
-        for i, node_x in enumerate(sample["node_history"]):
-            vehicle_h = self.vehicle_encoder(node_x.to(device))
-            # V2L then L2V: road context is genuinely bidirectional.
-            lane_h = self.vehicle_to_lane(vehicle_h, lane_h_base, sample["v2l_indices"][i].to(device))
-            vehicle_h = self.lane_to_vehicle(lane_h, vehicle_h, sample["l2v_indices"][i].to(device))
+        for layer in self.hgt:
+            node_h = layer(node_h, edge_index, edge_attr)
 
-            edge_attr = sample["edge_attrs"][i].to(device)
-            encoded_edge = self.itg_edge_encoder(edge_attr) if edge_attr.numel() else torch.empty((0, self.hidden_dim), device=device)
-            edge_index = sample["edge_indices"][i].to(device)
-            for layer in self.v2v_layers:
-                vehicle_h = layer(vehicle_h, edge_index, encoded_edge)
-            history.append(vehicle_h)
+        latest = sample["latest_vehicle_node_index"].to(device)
+        context = node_h["vehicle"][latest]
+        return self.decoder(
+            context,
+            sample["current_position"].to(device),
+            sample["current_orientation"].to(device),
+        )
 
-        # Causal VTV: each observed vehicle at t-1 -> itself at t.
-        time_major = torch.stack(history, dim=0)
-        t_steps, n_vehicles, _ = time_major.shape
-        flat = time_major.reshape(t_steps * n_vehicles, self.hidden_dim)
-        if t_steps > 1:
-            src, dst, delta = [], [], []
-            for t in range(1, t_steps):
-                dt = observation_times[t] - observation_times[t - 1]
-                for v in range(n_vehicles):
-                    src.append((t - 1) * n_vehicles + v)
-                    dst.append(t * n_vehicles + v)
-                    delta.append(dt)
-            vtv_index = torch.tensor([src, dst], dtype=torch.long, device=device)
-            delta_t = torch.stack(delta).to(device)
-            vtv_attr = self.vtv_edge_encoder(self.vtv_time2vec(delta_t))
-            flat = self.vtv_layer(flat, vtv_index, vtv_attr)
 
-        sequence = flat.reshape(t_steps, n_vehicles, self.hidden_dim).permute(1, 0, 2)
-        _, hidden_all = self.temporal_gru(sequence)
-        voi_index = int(sample["voi_index"])
-        context = hidden_all[-1, voi_index:voi_index + 1]
-        hidden = hidden_all[:, voi_index:voi_index + 1]
-
-        future_times = sample["prediction_times"].to(device)
-        future_t = self.future_time2vec(future_times).unsqueeze(0)
-        decoder_in = torch.cat([context.unsqueeze(1).expand(-1, self.pred_steps, -1), future_t], dim=-1)
-        decoded, _ = self.decoder(decoder_in, hidden)
-        return self.head(decoded)
+# Backward-compatible alias for old notebooks. It now points to the paper model.
+SimpleCommonRoadITGGNN = CrGeoTrajectoryPredictionModel

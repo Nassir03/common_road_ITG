@@ -156,10 +156,14 @@ def parse_commonroad_xml(path: str | Path) -> dict[str, Any]:
             l2l_edges.add((lane_id, other, RELATION_TO_ID["successor"]))
         left_adj = node.find("adjacentLeft")
         right_adj = node.find("adjacentRight")
+        # CommonRoad XML names the neighbor relative to the current lanelet:
+        # adjacentLeft => target is left of source. Table I in the paper names
+        # the relation by the SOURCE relative to TARGET for edge L -> L'.
+        # Therefore the paper relation label is intentionally swapped here.
         if left_adj is not None:
-            l2l_edges.add((lane_id, int(left_adj.attrib["ref"]), RELATION_TO_ID["adjacent_left"]))
+            l2l_edges.add((lane_id, int(left_adj.attrib["ref"]), RELATION_TO_ID["adjacent_right"]))
         if right_adj is not None:
-            l2l_edges.add((lane_id, int(right_adj.attrib["ref"]), RELATION_TO_ID["adjacent_right"]))
+            l2l_edges.add((lane_id, int(right_adj.attrib["ref"]), RELATION_TO_ID["adjacent_left"]))
 
     # Derived L2L relations from topology and geometry.
     lane_ids = sorted(lanelets)
