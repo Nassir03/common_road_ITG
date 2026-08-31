@@ -1,10 +1,4 @@
-# CommonRoad-Geometric Paper-Only Trajectory Prediction
-
-This repository implements only the traffic-graph and trajectory-prediction method described in:
-
-> E. Meyer et al., *Geometric Deep Learning for Autonomous Driving: Unlocking the Power of Graph Neural Networks With CommonRoad-Geometric*, IEEE IV 2023.
-
-It intentionally does **not** add a second traffic-interaction algorithm. The vehicle graph uses the paper's default Voronoi/Delaunay construction, with the paper-mentioned k-nearest-neighbor drawer used only as a safe fallback for degenerate point configurations where Delaunay triangulation is mathematically undefined.
+# CommonRoad-Geometric 
 
 ## What is implemented from the paper
 
@@ -27,29 +21,9 @@ It intentionally does **not** add a second traffic-interaction algorithm. The ve
 - ADE training objective; ADE and FDE evaluation.
 - Five future predictions for a 1.0 s horizon at 0.2 s intervals.
 
-## Necessary choices not specified numerically in the paper
-
-The paper does not state every training hyperparameter, exact history length, optimizer, batch size, random split ratio, or number/width of HGT layers. The values in `model/config.py` are therefore reproducible implementation choices, not claims about unpublished paper constants.
-
-The code uses five observed graph states because Fig. 3 illustrates `t-4,...,t`. The user can change this in one place (`OBS_STEPS`) if a different history is required.
-
-For an independent train/validation/test experiment, this repository uses a deterministic scenario-level 70/15/15 split. The paper only states that each city experiment is trained and validated using data collected in that same city; it does not publish a numerical split ratio.
-
-## Why this version is faster and more stable
-
-These changes do not alter the paper's graph relations or learning method:
-
-- expensive geometry is computed once during preprocessing and cached;
-- exact conflicting-lanelet discovery uses a spatial candidate grid before segment tests;
-- a persistent `sample_index.pt` prevents re-scanning every scenario at every run;
-- several disconnected graph windows are batched block-diagonally on the GPU;
-- finite-value checks stop immediately on bad input rather than producing `NaN` metrics and a later missing-checkpoint error;
-- local numeric translation/feature scaling is used only for floating-point stability and does not change physical distances or ADE/FDE units.
-
 ## Kaggle datasets
 
 The code automatically checks these paths:
-
 ```text
 /kaggle/input/datasets/abdullge26z811/boston/boston_t0.2_cleaneddata
 /kaggle/input/datasets/abdullge26z811/boston
@@ -62,8 +36,6 @@ The code automatically checks these paths:
 ```
 
 ## Kaggle: run one city from start to finish
-
-Create a Kaggle notebook, enable a GPU, and change only this variable when moving to another city:
 
 ```python
 CITY = "boston"
