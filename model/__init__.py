@@ -1,1 +1,1 @@
-"""CommonRoad-Geometric paper baseline + dynamic ITG extension."""
+"""Paper-only CommonRoad-Geometric trajectory-prediction implementation."""

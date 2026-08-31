@@ -1,3 +1,4 @@
+# Kaggle already provides a CUDA-enabled PyTorch build. Do not replace it.
 numpy>=1.26
 scipy>=1.11
 pytest>=8

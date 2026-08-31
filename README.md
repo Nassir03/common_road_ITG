@@ -1,100 +1,103 @@
-# CommonRoad-ITG + Paper-Aligned cr-geo Trajectory Prediction
+# CommonRoad-Geometric Paper-Only Trajectory Prediction
 
-This is a Kaggle-ready implementation for the three CommonRoad-NuPlan city archives used by Meyer et al. (2023): Boston, Pittsburgh, and Singapore.
+This repository implements only the traffic-graph and trajectory-prediction method described in:
 
-It supports two **fairly comparable V2V modes using the same heterogeneous temporal GNN**:
+> E. Meyer et al., *Geometric Deep Learning for Autonomous Driving: Unlocking the Power of Graph Neural Networks With CommonRoad-Geometric*, IEEE IV 2023.
 
-- `paper`: Delaunay/Voronoi-style V2V graph (the paper's default cr-geo V2V drawer)
-- `itg`: `ROT -> ROC -> ROI -> FIFO BFS -> inward ITG`, while keeping the other graph types/model unchanged
+It intentionally does **not** add a second traffic-interaction algorithm. The vehicle graph uses the paper's default Voronoi/Delaunay construction, with the paper-mentioned k-nearest-neighbor drawer used only as a safe fallback for degenerate point configurations where Delaunay triangulation is mathematically undefined.
 
-## Important scientific scope
+## What is implemented from the paper
 
-The 8-page paper states the graph types/features, HGT-style trajectory encoder, Time2Vec, lanelet GRU, GRU decoder, 1.0 s prediction horizon at 0.2 s, ADE training and ADE/FDE evaluation. It does **not** publish every training/splitting/hyperparameter detail. Therefore this project is a reproducible, paper-aligned implementation; it must not be described as a bit-for-bit reproduction of the authors' unpublished experiment setup.
+- Vehicle nodes and lanelet nodes.
+- V2V, V2L, L2V, L2L relations.
+- Temporal VTV relations for the same vehicle at different observed times.
+- Default V2V construction using Voronoi/Delaunay connectivity.
+- Center-based V2L assignment: a vehicle is connected to all lanelets containing its center.
+- L2L relation types: predecessor, successor, adjacent-left, adjacent-right, merging, diverging, conflicting.
+- Vehicle features from Table II: position, orientation, yaw-rate, velocity, acceleration, width, length.
+- V2V features from Table II: distance, relative position, relative orientation, relative velocity, relative acceleration.
+- V2L features from Table II: left/right boundary distance, lateral offset, heading error, projected arclength, normalized arclength.
+- L2L features from Table II: distance, relative position, relative orientation, intersection arclengths, adjacency type.
+- VTV features: V2V motion features plus elapsed time.
+- Edge-enhanced heterogeneous graph transformer (HGT-style) encoder using both node and edge features.
+- Time2Vec encoding of VTV elapsed time.
+- GRU encoding of variable-length lanelet boundary waypoint sequences.
+- Learnable L2L adjacency-type embedding.
+- GRU decoder predicting local `dx`, `dy`, `dtheta`, recursively integrated into future states.
+- ADE training objective; ADE and FDE evaluation.
+- Five future predictions for a 1.0 s horizon at 0.2 s intervals.
 
-The public cr-geo trajectory-prediction config is used for several implementation details that the paper does not enumerate (15 observed steps, 5 predicted steps, 8 graph layers, 16 heads, hidden size 256, Time2Vec 16, GRU decoder hidden 512, non-overlapping 20-step temporal collections).
+## Necessary choices not specified numerically in the paper
 
-## Kaggle dataset paths
+The paper does not state every training hyperparameter, exact history length, optimizer, batch size, random split ratio, or number/width of HGT layers. The values in `model/config.py` are therefore reproducible implementation choices, not claims about unpublished paper constants.
+
+The code uses five observed graph states because Fig. 3 illustrates `t-4,...,t`. The user can change this in one place (`OBS_STEPS`) if a different history is required.
+
+For an independent train/validation/test experiment, this repository uses a deterministic scenario-level 70/15/15 split. The paper only states that each city experiment is trained and validated using data collected in that same city; it does not publish a numerical split ratio.
+
+## Why this version is faster and more stable
+
+These changes do not alter the paper's graph relations or learning method:
+
+- expensive geometry is computed once during preprocessing and cached;
+- exact conflicting-lanelet discovery uses a spatial candidate grid before segment tests;
+- a persistent `sample_index.pt` prevents re-scanning every scenario at every run;
+- several disconnected graph windows are batched block-diagonally on the GPU;
+- finite-value checks stop immediately on bad input rather than producing `NaN` metrics and a later missing-checkpoint error;
+- local numeric translation/feature scaling is used only for floating-point stability and does not change physical distances or ADE/FDE units.
+
+## Kaggle datasets
 
 The code automatically checks these paths:
 
 ```text
-Boston:
 /kaggle/input/datasets/abdullge26z811/boston/boston_t0.2_cleaneddata
 /kaggle/input/datasets/abdullge26z811/boston
 
-Pittsburgh:
 /kaggle/input/datasets/abdullge26z811/pittsburgh/pittsburgh_t0.2_cleaneddata
 /kaggle/input/datasets/abdullge26z811/pittsburgh
 
-Singapore:
 /kaggle/input/datasets/abdullge26z811/singapore/singapore_t0.2_cleaneddata
 /kaggle/input/datasets/abdullge26z811/singapore
 ```
 
-You choose one city and finish it before changing only the `CITY` variable for the next city.
+## Kaggle: run one city from start to finish
 
----
-
-# Exact Kaggle workflow
-
-## 1. Kaggle settings
-
-Create a notebook and enable:
-
-- Accelerator: GPU
-- Internet: On (needed only to clone GitHub)
-
-## 2. Clone the repository
+Create a Kaggle notebook, enable a GPU, and change only this variable when moving to another city:
 
 ```python
+CITY = "boston"
+# later: "pittsburgh"
+# later: "singapore"
+```
+
+### 1. Check GPU
+
+```python
+import torch
+print("PyTorch:", torch.__version__)
+print("CUDA:", torch.cuda.is_available())
+print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+```
+
+### 2. Clone the repository
+
+```python
+%cd /kaggle/working
+!rm -rf common_road_ITG
 !git clone https://github.com/Nassir03/common_road_ITG.git
 %cd /kaggle/working/common_road_ITG
 ```
 
-**The GitHub repository must contain the corrected files from this package first.** The public repository snapshot checked on 2026-08-30 has a stale README that still uses `--edge-mode`, while its current `train.py` does not accept that argument and its current `gnn_dataset.py` contains only the paper V2V graph. Push this corrected package before using the commands below.
+### 3. Install only the extra Kaggle requirements
 
-## 3. Choose only one city
-
-```python
-CITY = "boston"   # later change only to "pittsburgh" or "singapore"
-print(CITY)
-```
-
-## 4. Verify Kaggle data and GPU
-
-```python
-from pathlib import Path
-import torch
-
-print("torch:", torch.__version__)
-print("cuda:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("gpu:", torch.cuda.get_device_name(0))
-
-root = Path(f"/kaggle/input/datasets/abdullge26z811/{CITY}")
-files = list(root.rglob("*.xml"))
-print("dataset root:", root)
-print("XML files:", len(files))
-print("first file:", files[0] if files else "NONE")
-```
-
-Paper scenario counts are:
-
-- Boston: 938
-- Pittsburgh: 1,560
-- Singapore: 2,372
-
-If your Kaggle upload contains a different count, the code uses the files actually present and prints a warning.
-
-## 5. Install only missing lightweight dependencies
-
-Kaggle already ships a CUDA-compatible PyTorch build. Do not replace it unless required.
+Do not replace Kaggle's CUDA-enabled PyTorch build.
 
 ```python
 !python -m pip install -q -r requirements-kaggle.txt
 ```
 
-## 6. Tests
+### 4. Run tests
 
 ```python
 !python -m pytest -q
@@ -103,228 +106,142 @@ Kaggle already ships a CUDA-compatible PyTorch build. Do not replace it unless r
 Expected for this package:
 
 ```text
-5 passed
+7 passed
 ```
 
-## 7. Prepare the chosen city
+### 5. Inspect the selected Kaggle dataset
 
 ```python
-!python scripts/prepare_city.py --city {CITY} --overwrite
+!python scripts/inspect_kaggle_data.py --city {CITY}
 ```
 
-This creates:
+### 6. Small preprocessing test first
 
-```text
-data/<CITY>/processed/train/*.scenario.pt
-data/<CITY>/processed/val/*.scenario.pt
-data/<CITY>/processed/test/*.scenario.pt
-data/<CITY>/split_manifest.csv
-data/<CITY>/summary.json
-```
-
-The split is deterministic at the **scenario level**: 70% train, 15% validation, 15% test. This ratio is an explicit reproducibility choice because the paper does not publish an exact train/validation/test ratio.
-
-## 8. Smoke test the paper baseline
+This checks the XML format without processing the whole city:
 
 ```python
-!python scripts/train.py --city {CITY} --v2v-mode paper --epochs 1 --max-train-samples 2 --max-val-samples 1 --max-test-samples 1 --output outputs/{CITY}_paper_smoke.pt
+!python scripts/prepare_city.py --city {CITY} --max-scenarios 20 --workers 4 --overwrite
 ```
 
-## 9. Smoke test the ITG extension
+Then validate the resulting graphs:
 
 ```python
-!python scripts/train.py --city {CITY} --v2v-mode itg --epochs 1 --max-train-samples 2 --max-val-samples 1 --max-test-samples 1 --output outputs/{CITY}_itg_smoke.pt
+!python scripts/validate_city.py --city {CITY} --samples 4
 ```
 
-If both complete and print `device=cuda`, start the full experiments.
-
-## 10. Train paper baseline
+If validation succeeds, prepare the full city:
 
 ```python
-!python scripts/train.py --city {CITY} --v2v-mode paper --epochs 30 --output outputs/{CITY}_paper.pt
+!python scripts/prepare_city.py --city {CITY} --workers 4 --overwrite
 ```
 
-## 11. Train ITG extension
+Do not run the small preprocessing command again after the full command, because `--overwrite` replaces the processed folder.
+
+### 7. Validate real processed data before training
 
 ```python
-!python scripts/train.py --city {CITY} --v2v-mode itg --epochs 30 --output outputs/{CITY}_itg.pt
+!python scripts/validate_city.py --city {CITY} --samples 8
 ```
 
-## 12. Evaluate both on the held-out test split
+This checks that graph tensors, targets, and model predictions are finite.
+
+### 8. Training smoke test
 
 ```python
-!python scripts/evaluate.py --city {CITY} --checkpoint outputs/{CITY}_paper.pt --output-csv outputs/{CITY}_paper_test.csv
-!python scripts/evaluate.py --city {CITY} --checkpoint outputs/{CITY}_itg.pt --output-csv outputs/{CITY}_itg_test.csv
+!python scripts/train.py \
+    --city {CITY} \
+    --epochs 1 \
+    --max-train-samples 32 \
+    --max-val-samples 16 \
+    --max-test-samples 16 \
+    --batch-size 4 \
+    --workers 2 \
+    --patience 0 \
+    --output outputs/{CITY}_crgeo_smoke.pt
 ```
 
-## 13. Compare
+The output must contain finite `train_ADE`, `val_ADE`, `val_FDE`, and a saved checkpoint.
+
+### 9. Full training
 
 ```python
-!python scripts/compare_results.py --paper outputs/{CITY}_paper.results.json --itg outputs/{CITY}_itg.results.json
+!python scripts/train.py \
+    --city {CITY} \
+    --epochs 20 \
+    --batch-size 4 \
+    --workers 2 \
+    --output outputs/{CITY}_crgeo_paper.pt
 ```
 
-## 14. Inspect a prediction
+Early stopping is enabled by default.
+
+### 10. Evaluate the held-out test split
 
 ```python
-!python scripts/predict.py --city {CITY} --checkpoint outputs/{CITY}_itg.pt --index 0
+!python scripts/evaluate.py \
+    --city {CITY} \
+    --checkpoint outputs/{CITY}_crgeo_paper.pt \
+    --output-csv outputs/{CITY}_crgeo_test.csv
 ```
 
-## 15. Save outputs from Kaggle
+The reported metrics are mean ADE and mean FDE in metres.
+
+### 11. Inspect one prediction
 
 ```python
-!zip -r /kaggle/working/{CITY}_commonroad_itg_results.zip outputs data/{CITY}/summary.json data/{CITY}/split_manifest.csv
+!python scripts/predict.py \
+    --city {CITY} \
+    --checkpoint outputs/{CITY}_crgeo_paper.pt \
+    --index 0
 ```
 
-Download the zip from Kaggle's Output panel.
+### 12. Save Kaggle outputs
 
----
+```python
+!zip -r /kaggle/working/{CITY}_crgeo_paper_results.zip \
+    outputs \
+    data/{CITY}/summary.json \
+    data/{CITY}/split_manifest.csv
+```
 
-# Changing to another dataset
-
-Once Boston is completely finished, change **only**:
+After Boston completes, change only:
 
 ```python
 CITY = "pittsburgh"
 ```
 
-and rerun Steps 4-15.
+and rerun steps 5-12. Then do the same for Singapore.
 
-After Pittsburgh is complete, change only:
+## Paper reference metrics
 
-```python
-CITY = "singapore"
-```
-
-and rerun Steps 4-15.
-
-The code resolves the correct Kaggle folder automatically.
-
----
-
-# Data -> graph -> GNN pipeline
-
-For every 20-step non-overlapping temporal window:
-
-```text
-15 observed states @ 0.2 s + 5 future states @ 0.2 s
-                        |
-                        v
-        vehicle nodes + lanelet nodes
-                        |
-       +----------------+----------------+
-       |                |                |
-      V2L/L2V          L2L              VTV
-       |                |                |
-       +----------------+----------------+
-                        |
-                  V2V graph mode
-                 /              \
-        paper baseline          ITG extension
-       Delaunay/Voronoi    ROT->ROC->ROI->BFS->ITG
-                 \              /
-                  edge-enhanced HGT
-                        |
-                  Time2Vec on VTV
-                        |
-                 lanelet GRU encoder
-                        |
-                    GRU decoder
-                        |
-           5 future (x,y,orientation) states
-                        |
-                      ADE/FDE
-```
-
-## Paper V2V edge features (8)
-
-For source vehicle `i -> j`:
-
-1. Euclidean distance
-2. source-local relative x
-3. source-local relative y
-4. relative orientation
-5. source-local relative velocity x
-6. source-local relative velocity y
-7. source-local relative acceleration x
-8. source-local relative acceleration y
-
-## ITG V2V edge features (12)
-
-The ITG keeps those same 8 physical V2V features and adds:
-
-9. normalized BFS hop = `hop / MAX_HOPS`
-10. normalized branch = `branch / branch_count`
-11. direct/indirect = `1` for hop 1, else `0`
-12. normalized ITG distance = `min(distance / ROI_RADIUS, 1)`
-
-Thus the experimental comparison changes the V2V topology and adds the information required to describe the hop-aware ITG, while V2L, L2V, L2L, VTV, HGT and decoder remain common.
-
-## ITG construction
-
-At each observed time step:
-
-1. **ROT** = all vehicles in the current traffic snapshot.
-2. **ROC** = undirected communication graph with pairwise distance <= `COMMUNICATION_RADIUS`.
-3. **ROI(V_i)** = vehicles within `ROI_RADIUS` of each vehicle of interest `V_i`.
-4. **BFS** = FIFO breadth-first search from `V_i` on the ROC graph, restricted to ROI and `MAX_HOPS`.
-5. **ITG direction** = reverse each BFS-tree parent edge so influence points inward to the VOI.
-6. Rebuild the graph at the next time step.
-
-Default experimental ITG values:
-
-```text
-ROC radius = 35 m
-ROI radius = 80 m
-MAX_HOPS   = 4
-```
-
-These three ITG values are **research choices for the extension**; they are not parameters stated by the CommonRoad-Geometric paper.
-
----
-
-# Paper alignment vs implementation choices
-
-## Directly supported by Meyer et al. (2023)
-
-- heterogeneous vehicle/lanelet graph
-- V2V, V2L/L2V, L2L and VTV relations
-- custom V2V edge drawer concept
-- Table-II node/edge geometry
-- edge-enhanced HGT concept
-- GRU encoding of lanelet waypoint sequences
-- learnable L2L adjacency embedding
-- Time2Vec for VTV time delta
-- GRU decoder producing local position/orientation transitions
-- ADE training objective
-- 1.0 s future horizon, 0.2 s interval (5 steps)
-- ADE and FDE reporting
-
-## Public cr-geo repository details used where the paper is silent
-
-- 15 observed steps
-- 20-step temporal collection and non-overlap
-- 256-dimensional node hidden representation
-- 8 GNN layers
-- 16 attention heads
-- Time2Vec dimension 16
-- decoder GRU hidden size 512
-
-## Explicit choices in this reproducible project, not claimed as paper constants
-
-- seed 42
-- scenario split 70/15/15
-- AdamW, learning rate `1e-3`, weight decay `1e-5`
-- 30 epochs
-- ITG ROC/ROI radii and `MAX_HOPS`
-
-Because those details are not all stated in the paper, **do not promise that your numerical ADE/FDE will exactly equal Table IV**. The published reference values are useful comparison targets, not guaranteed outputs of this independent implementation.
-
-Paper Table-IV reference values:
+The paper reports:
 
 | City | Scenarios | ADE (m) | FDE (m) |
 |---|---:|---:|---:|
-| Singapore | 2,372 | 0.106 | 0.227 |
+| Singapore | 2372 | 0.106 | 0.227 |
 | Boston | 938 | 0.138 | 0.316 |
-| Pittsburgh | 1,560 | 0.215 | 0.454 |
+| Pittsburgh | 1560 | 0.215 | 0.454 |
 
-Your scientific result is the controlled comparison between `paper` and `itg` under the same data split and model/training code.
+Those are published reference values, not guaranteed outputs of this independent reimplementation. The paper does not expose every experiment setting, and the Kaggle copy may contain a different number of scenarios (the user's prior Boston run showed 926 XML files rather than 938).
+
+## Project layout
+
+```text
+model/
+  config.py          paper-aligned constants and explicit implementation choices
+  scenario.py        CommonRoad XML + lanelet/vehicle preprocessing
+  geometry.py        Table-II graph feature calculations + Voronoi/Delaunay edges
+  indexing.py        temporal window index
+  gnn_dataset.py     heterogeneous temporal graph construction
+  batching.py        block-diagonal graph batching
+  gnn_model.py       edge-enhanced HGT + Time2Vec + lane GRU + trajectory GRU decoder
+  metrics.py         ADE/FDE
+
+scripts/
+  inspect_kaggle_data.py
+  prepare_city.py
+  validate_city.py
+  train.py
+  evaluate.py
+  predict.py
+```

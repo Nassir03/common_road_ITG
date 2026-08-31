@@ -1,38 +1,50 @@
-## Expected folder layout after CommonRoad conversion
+# Dataset Setup
 
-For each city experiment, prepare its own root so training and validation remain within that city:
+```python
+CITY = "boston"
+```
 
 ```text
-Singapore/
-  raw/train/*.xml
-  raw/val/*.xml
-  raw/test/*.xml       # optional if you maintain a held-out set
+Boston:
+/kaggle/input/datasets/abdullge26z811/boston/boston_t0.2_cleaneddata
+/kaggle/input/datasets/abdullge26z811/boston
 
-Boston/
-  raw/train/*.xml
-  raw/val/*.xml
-  raw/test/*.xml
+Pittsburgh:
+/kaggle/input/datasets/abdullge26z811/pittsburgh/pittsburgh_t0.2_cleaneddata
+/kaggle/input/datasets/abdullge26z811/pittsburgh
 
-Pittsburgh/
-  raw/train/*.xml
-  raw/val/*.xml
-  raw/test/*.xml
+Singapore:
+/kaggle/input/datasets/abdullge26z811/singapore/singapore_t0.2_cleaneddata
+/kaggle/input/datasets/abdullge26z811/singapore
 ```
 
-Then preprocess one city, for example:
+Inspect:
 
 ```bash
-python scripts/preprocess.py \
-  --raw-root /path/to/Singapore/raw \
-  --processed-root /path/to/Singapore/processed
+python scripts/inspect_kaggle_data.py --city boston
 ```
 
-Train only on that city's processed root:
+Prepare:
 
 ```bash
-python scripts/train.py \
-  --data-root /path/to/Singapore/processed \
-  --output outputs/singapore_model.pt
+python scripts/prepare_city.py --city boston --workers 4 --overwrite
 ```
 
-Repeat independently for Boston and Pittsburgh.
+The output is:
+
+```text
+data/boston/
+  split_manifest.csv
+  summary.json
+  processed/
+    train/
+      *.scenario.pt
+      sample_index.pt
+    val/
+      *.scenario.pt
+      sample_index.pt
+    test/
+      *.scenario.pt
+      sample_index.pt
+```
+

@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-"""Train either the paper baseline (Voronoi/Delaunay V2V) or the ITG extension."""
+"""Train the paper-only CommonRoad-Geometric trajectory-prediction model."""
 from __future__ import annotations
+
 import argparse
 import json
+import math
 from pathlib import Path
 import random
 import sys
@@ -14,138 +16,288 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Subset
 
-from model.config import EPOCHS, LEARNING_RATE, WEIGHT_DECAY, GRAD_CLIP_NORM, SEED
+from model.batching import batch_graph_samples
+from model.config import (
+    EPOCHS,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+    GRAD_CLIP_NORM,
+    SEED,
+    BATCH_SIZE,
+    NUM_WORKERS,
+    EARLY_STOPPING_PATIENCE,
+)
 from model.gnn_dataset import CommonRoadTemporalGraphDataset
 from model.gnn_model import CrGeoTrajectoryPredictionModel
 from model.metrics import ade_loss, ade_fde
 
 
-def set_seed(seed: int):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def sample_to_device_target(sample, device):
-    return sample["target_position"].to(device), sample["target_mask"].to(device)
+def _loader(dataset, indices, batch_size: int, workers: int, device: torch.device):
+    subset = Subset(dataset, indices)
+    kwargs = dict(
+        dataset=subset,
+        batch_size=max(1, batch_size),
+        shuffle=False,
+        num_workers=max(0, workers),
+        collate_fn=batch_graph_samples,
+        pin_memory=device.type == "cuda",
+        persistent_workers=False,
+    )
+    if workers > 0:
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(**kwargs)
 
 
-def run_dataset(model, dataset, indices, device, optimizer=None, grad_clip=GRAD_CLIP_NORM):
+def _finite_or_raise(name: str, tensor: torch.Tensor, metadata) -> None:
+    if torch.isfinite(tensor).all():
+        return
+    bad = int((~torch.isfinite(tensor)).sum().detach().cpu())
+    ids = [m.get("benchmark_id") for m in metadata] if isinstance(metadata, list) else [str(metadata)]
+    raise FloatingPointError(f"Non-finite {name}: {bad} values. Samples={ids[:8]}")
+
+
+def run_dataset(
+    model,
+    dataset,
+    indices,
+    device,
+    optimizer=None,
+    batch_size: int = BATCH_SIZE,
+    workers: int = NUM_WORKERS,
+    grad_clip: float = GRAD_CLIP_NORM,
+):
     training = optimizer is not None
     model.train(training)
-    total_loss = 0.0; total_ade = 0.0; total_fde = 0.0; n_samples = 0; n_targets = 0
+    total_ade = 0.0
+    total_fde = 0.0
+    n_targets = 0
+    n_batches = 0
     start = time.time()
-    for step, idx in enumerate(indices, 1):
-        sample = dataset[idx]
-        target, mask = sample_to_device_target(sample, device)
-        if not bool(mask.any()):
-            continue
-        if training:
-            optimizer.zero_grad(set_to_none=True)
-        with torch.set_grad_enabled(training):
-            pred = model(sample)["position"]
-            loss = ade_loss(pred, target, mask)
+    loader = _loader(dataset, indices, batch_size, workers, device)
+    context = torch.enable_grad() if training else torch.inference_mode()
+
+    with context:
+        for step, batch in enumerate(loader, 1):
+            target = batch["target_position"].to(device, non_blocking=True)
+            mask = batch["target_mask"].to(device, non_blocking=True)
+            if not bool(mask.any()):
+                continue
+            _finite_or_raise("target_position", target, batch["meta"])
+
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+
+            prediction = model(batch)["position"]
+            _finite_or_raise("prediction", prediction, batch["meta"])
+            loss = ade_loss(prediction, target, mask)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite ADE loss. Samples={[m.get('benchmark_id') for m in batch['meta']][:8]}"
+                )
+
             if training:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if not torch.isfinite(torch.as_tensor(gradient_norm)):
+                    raise FloatingPointError("Non-finite gradient norm")
                 optimizer.step()
-        metrics = ade_fde(pred.detach(), target, mask)
-        total_loss += float(loss.detach().cpu()); total_ade += metrics["ade"] * metrics["count"]; total_fde += metrics["fde"] * metrics["count"]
-        n_samples += 1; n_targets += metrics["count"]
-        if step % 250 == 0:
-            elapsed = time.time() - start
-            print(f"    step {step}/{len(indices)} ({elapsed:.1f}s)", flush=True)
-    if n_samples == 0 or n_targets == 0:
-        return {"loss": float("nan"), "ade": float("nan"), "fde": float("nan"), "samples": 0, "targets": 0}
-    return {"loss": total_loss/n_samples, "ade": total_ade/n_targets, "fde": total_fde/n_targets, "samples": n_samples, "targets": n_targets}
+
+            metrics = ade_fde(prediction.detach(), target, mask)
+            total_ade += metrics["ade"] * metrics["count"]
+            total_fde += metrics["fde"] * metrics["count"]
+            n_targets += metrics["count"]
+            n_batches += 1
+
+            if step % 50 == 0 or step == len(loader):
+                print(
+                    f"    batch {step}/{len(loader)} targets={n_targets} elapsed={time.time() - start:.1f}s",
+                    flush=True,
+                )
+
+    if n_targets == 0:
+        return {
+            "ade": float("nan"),
+            "fde": float("nan"),
+            "batches": 0,
+            "targets": 0,
+            "seconds": time.time() - start,
+        }
+    return {
+        "ade": total_ade / n_targets,
+        "fde": total_fde / n_targets,
+        "batches": n_batches,
+        "targets": n_targets,
+        "seconds": time.time() - start,
+    }
 
 
-def evaluate_split(model, dataset, device, max_samples=0):
-    indices = list(range(len(dataset)))
-    if max_samples > 0:
-        indices = indices[:max_samples]
-    with torch.no_grad():
-        return run_dataset(model, dataset, indices, device, optimizer=None)
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--city", required=True, choices=["boston", "pittsburgh", "singapore"])
-    ap.add_argument("--v2v-mode", default="paper", choices=["paper", "itg"], help="paper=Delaunay/Voronoi baseline; itg=ROT->ROC->ROI->BFS->ITG")
-    ap.add_argument("--data-root", default=None, help="Default data/<city>/processed")
-    ap.add_argument("--epochs", type=int, default=EPOCHS)
-    ap.add_argument("--output", default=None)
-    ap.add_argument("--seed", type=int, default=SEED)
-    ap.add_argument("--max-train-samples", type=int, default=0)
-    ap.add_argument("--max-val-samples", type=int, default=0)
-    ap.add_argument("--max-test-samples", type=int, default=0)
-    args = ap.parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--city", required=True, choices=["boston", "pittsburgh", "singapore"])
+    parser.add_argument("--data-root", default=None, help="Default: data/<city>/processed")
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--max-val-samples", type=int, default=0)
+    parser.add_argument("--max-test-samples", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS)
+    parser.add_argument("--patience", type=int, default=EARLY_STOPPING_PATIENCE)
+    args = parser.parse_args()
 
     set_seed(args.seed)
+    torch.set_float32_matmul_precision("high")
+
     data_root = Path(args.data_root) if args.data_root else ROOT / "data" / args.city / "processed"
-    output = Path(args.output) if args.output else ROOT / "outputs" / f"{args.city}_{args.v2v_mode}.pt"
+    output = Path(args.output) if args.output else ROOT / "outputs" / f"{args.city}_crgeo_paper.pt"
     output.parent.mkdir(parents=True, exist_ok=True)
+    # Never reuse a stale checkpoint from an earlier failed run.
+    if output.exists():
+        output.unlink()
+    stale_results = output.with_suffix(".results.json")
+    if stale_results.exists():
+        stale_results.unlink()
 
-    train_ds = CommonRoadTemporalGraphDataset(data_root / "train", v2v_mode=args.v2v_mode)
-    val_ds = CommonRoadTemporalGraphDataset(data_root / "val", v2v_mode=args.v2v_mode)
-    test_ds = CommonRoadTemporalGraphDataset(data_root / "test", v2v_mode=args.v2v_mode)
-    print(f"city={args.city} mode={args.v2v_mode}")
-    print(f"scenario_files train={len(train_ds.files)} val={len(val_ds.files)} test={len(test_ds.files)}")
-    print(f"samples train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
-
-    if len(train_ds) == 0 or len(val_ds) == 0 or len(test_ds) == 0:
-        raise RuntimeError("One split has zero valid 15-observation + 5-future samples. Check preprocessing/dt and dataset content.")
+    index_start = time.time()
+    train_dataset = CommonRoadTemporalGraphDataset(data_root / "train")
+    val_dataset = CommonRoadTemporalGraphDataset(data_root / "val")
+    test_dataset = CommonRoadTemporalGraphDataset(data_root / "test")
+    print(f"dataset index load={time.time() - index_start:.2f}s")
+    print(f"city={args.city}")
+    print(
+        f"scenario_files train={len(train_dataset.files)} val={len(val_dataset.files)} test={len(test_dataset.files)}"
+    )
+    print(
+        f"samples train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}"
+    )
+    if min(len(train_dataset), len(val_dataset), len(test_dataset)) == 0:
+        raise RuntimeError("One split has zero valid temporal trajectory samples")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}")
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(0)}")
-    model = CrGeoTrajectoryPredictionModel(v2v_edge_dim=train_ds.v2v_edge_dim).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    best_val = float("inf"); best_epoch = 0; history=[]
-    for epoch in range(1, args.epochs+1):
-        train_idx = train_ds.epoch_indices(args.seed + epoch, args.max_train_samples)
-        val_idx = list(range(len(val_ds)))
-        if args.max_val_samples > 0: val_idx = val_idx[:args.max_val_samples]
-        train_m = run_dataset(model, train_ds, train_idx, device, optimizer=optimizer)
-        with torch.no_grad():
-            val_m = run_dataset(model, val_ds, val_idx, device, optimizer=None)
-        row = {"epoch": epoch, "train": train_m, "val": val_m}; history.append(row)
-        print(f"epoch={epoch:03d} train_ADE={train_m['ade']:.6f} val_ADE={val_m['ade']:.6f} val_FDE={val_m['fde']:.6f}", flush=True)
-        if val_m["ade"] < best_val:
-            best_val = val_m["ade"]; best_epoch = epoch
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "model_kwargs": {"v2v_edge_dim": train_ds.v2v_edge_dim},
-                "city": args.city, "v2v_mode": args.v2v_mode,
-                "best_epoch": best_epoch, "best_val_ade": best_val,
-                "data_root": str(data_root), "seed": args.seed,
-            }, output)
+    model = CrGeoTrajectoryPredictionModel().to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+
+    best_val = float("inf")
+    best_epoch = 0
+    bad_epochs = 0
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        train_indices = train_dataset.epoch_indices(args.seed + epoch, args.max_train_samples)
+        val_indices = list(range(len(val_dataset)))
+        if args.max_val_samples > 0:
+            val_indices = val_indices[: args.max_val_samples]
+
+        train_metrics = run_dataset(
+            model,
+            train_dataset,
+            train_indices,
+            device,
+            optimizer,
+            args.batch_size,
+            args.workers,
+        )
+        val_metrics = run_dataset(
+            model,
+            val_dataset,
+            val_indices,
+            device,
+            None,
+            args.batch_size,
+            args.workers,
+        )
+        history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
+
+        print(
+            f"epoch={epoch:03d} "
+            f"train_ADE={train_metrics['ade']:.6f} "
+            f"val_ADE={val_metrics['ade']:.6f} "
+            f"val_FDE={val_metrics['fde']:.6f} "
+            f"train_s={train_metrics['seconds']:.1f} val_s={val_metrics['seconds']:.1f}",
+            flush=True,
+        )
+
+        if math.isfinite(val_metrics["ade"]) and val_metrics["ade"] < best_val:
+            best_val = val_metrics["ade"]
+            best_epoch = epoch
+            bad_epochs = 0
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model_kwargs": {},
+                    "city": args.city,
+                    "best_epoch": best_epoch,
+                    "best_val_ade": best_val,
+                    "data_root": str(data_root),
+                    "seed": args.seed,
+                    "method": "CommonRoad-Geometric paper-only Voronoi/Delaunay + causal VTV + edge-enhanced HGT",
+                },
+                output,
+            )
             print(f"  saved best checkpoint -> {output}")
+        else:
+            bad_epochs += 1
 
-    ckpt = torch.load(output, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    with torch.no_grad():
-        test_m = evaluate_split(model, test_ds, device, args.max_test_samples)
+        if args.patience > 0 and bad_epochs >= args.patience:
+            print(
+                f"early stopping after {bad_epochs} epochs without validation improvement"
+            )
+            break
+
+    if not output.exists():
+        raise RuntimeError(
+            "No checkpoint was saved because validation ADE was never finite. "
+            "The run stops here with the real cause instead of a later FileNotFoundError."
+        )
+
+    checkpoint = torch.load(output, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    test_indices = list(range(len(test_dataset)))
+    if args.max_test_samples > 0:
+        test_indices = test_indices[: args.max_test_samples]
+    test_metrics = run_dataset(
+        model,
+        test_dataset,
+        test_indices,
+        device,
+        None,
+        args.batch_size,
+        args.workers,
+    )
+
     result = {
         "city": args.city,
-        "v2v_mode": args.v2v_mode,
         "checkpoint": str(output),
         "best_epoch": best_epoch,
-        "best_val_ade_m": best_val,
-        "test_ADE_m": test_m["ade"],
-        "test_FDE_m": test_m["fde"],
-        "test_samples": test_m["samples"],
-        "test_targets": test_m["targets"],
+        "best_val_ADE_m": best_val,
+        "test_ADE_m": test_metrics["ade"],
+        "test_FDE_m": test_metrics["fde"],
+        "test_targets": test_metrics["targets"],
         "history": history,
     }
     result_path = output.with_suffix(".results.json")
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print("\nFINAL TEST")
-    print(json.dumps({k:v for k,v in result.items() if k != "history"}, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k != "history"}, indent=2))
     print(f"results={result_path}")
+
 
 if __name__ == "__main__":
     main()
